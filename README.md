@@ -1,109 +1,82 @@
-# New Nx Repository
+# Repro: Nx 23.2.x daemon churns on transient `_tmp_<pid>_<hex>` files (macOS)
 
-<a alt="Nx logo" href="https://nx.dev" target="_blank" rel="noreferrer"><img src="https://raw.githubusercontent.com/nrwl/nx/master/images/nx-logo.png" width="45"></a>
+Minimal reproduction for an Nx daemon that never goes idle. This is a bare
+`create-nx-workspace` output with **zero projects**. Nothing is running: no dev
+server, no build, no `nx` command after the initial graph.
 
-✨ Your new, shiny [Nx workspace](https://nx.dev) is ready ✨.
+The outputs watcher reports an endless stream of deletions of transient
+`_tmp_<pid>_<hex>` files created in the workspace root, and `daemon.log` grows
+continuously.
 
-[Learn more about this workspace setup and its capabilities](https://nx.dev/docs/technologies/typescript/introduction?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or run `npx nx graph` to visually explore what was created. Now, let's get you up to speed!
+Fixed on `master` (appears to be #36912, follow-up #37025), **not backported to
+the `23.2.x` branch**, so the current `latest` tag is affected.
 
-🚀 If you haven't connected to Nx Cloud yet, [complete your setup here](https://cloud.nx.app/get-started). Get faster builds with remote caching, distributed task execution, and self-healing CI. [See how your workspace can benefit](#nx-cloud).
+## Reproduce
 
-## Generate a library
-
-```sh
-npx nx g @nx/js:lib packages/pkg1 --publishable --importPath=@my-org/pkg1
+```bash
+pnpm install
+./measure.sh
 ```
 
-## Run tasks
+`measure.sh` stops the daemon, clears the log, computes the graph once, waits,
+and then reports log size, growth rate and `_tmp_` event count.
 
-To build the library use:
+## Observed
 
-```sh
-npx nx run pkg1:build
+Each row is the same workspace, 25s settle + 10s growth sample, on
+macOS 27.0.0 / arm64 / Node 24.21.0 / pnpm 12.4.2.
+
+| configuration | `daemon.log` | growth | `_tmp_` events |
+|---|---|---|---|
+| nx 23.2.0, default `@nx/js/typescript` plugin | 644 KB | +222 KB/10s | 735 |
+| nx 23.2.0, `plugins: []` | 580 KB | +210 KB/10s | 629 |
+| nx 23.2.0 + `.nxignore` containing `_tmp_*` | 20 KB | flat | **0** |
+| nx 23.3.0-beta.5 | 24 KB | flat | 7 |
+
+Notes on what this rules out:
+
+- **Not plugin-related.** It reproduces with `plugins: []`.
+- **Not project-related.** There are no projects.
+- **Not graph recomputation.** `Recomputing project graph` stays at 0-1 through
+  the whole window; the work is elsewhere in the change-handling path.
+- **The temp files are not new.** 22.7.1 creates them too (83 events in an
+  equivalent window) without the runaway, so whatever writes them is not the
+  regression. I was unable to identify the writer: the names do not appear in
+  `nx`'s JS or in `nx.darwin-arm64.node`, and the processes named in them exit
+  too fast to inspect. The files are zero-length and land in the workspace root.
+
+On a real 80-project workspace the same loop reached 190% node CPU, a
+`daemon.log` growing ~11 MB/min (400 MB in 35 minutes), and a load average of
+10.86. It also accelerates: process spawn rate hit ~55/s.
+
+## Log excerpt
+
+```
+[NX v23.2.0 Daemon Server] - [WATCHER]: Processing file changes in outputs
+[NX v23.2.0 Daemon Server] - [WATCHER]: 0 file(s) created or restored, 0 file(s) modified, 5 file(s) deleted
+[NX v23.2.0 Daemon Server] - [WATCHER]: [watcher] routeWorkspaceChanges batch: 5 events: delete:_tmp_80947_019f92b8, delete:_tmp_80949_021dd308, ...
 ```
 
-To run any task with Nx use:
+## Workaround
 
-```sh
-npx nx run <project-name>:<target>
+```bash
+printf '_tmp_*\n' >> .nxignore
+npx nx daemon --stop
+rm -rf .nx/workspace-data/d
 ```
 
-These targets are either [inferred automatically](https://nx.dev/docs/concepts/inferred-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or defined in the `project.json` or `package.json` files.
+Stopping the daemon alone is not enough; the next `nx` invocation or IDE
+connection restarts it into the same loop.
 
-[More about running tasks in the docs &raquo;](https://nx.dev/docs/features/run-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+## Suspected cause
 
-## Versioning and releasing
+Diffing the published `23.2.1` and `23.3.0-beta.5` tarballs, the relevant change
+is in `packages/nx/src/daemon/server/handle-outputs-changes.ts`: a per-path
+`isKnownWorkspaceFile()` became a batched `trackedFilesInContext()` guarded by
+`invalidating.length`, commented:
 
-To version and release the library use
+> Skips the napi call, which takes the files mutex and can wait out a re-walk,
+> for the common batch that classifies nothing.
 
-```
-npx nx release
-```
-
-Pass `--dry-run` to see what would happen without actually releasing the library.
-
-[Learn more about Nx release &raquo;](https://nx.dev/docs/features/manage-releases?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-## Keep TypeScript project references up to date
-
-Nx automatically updates TypeScript [project references](https://www.typescriptlang.org/docs/handbook/project-references.html) in `tsconfig.json` files to ensure they remain accurate based on your project dependencies (`import` or `require` statements). This sync is automatically done when running tasks such as `build` or `typecheck`, which require updated references to function correctly.
-
-To manually trigger the process to sync the project graph dependencies information to the TypeScript project references, run the following command:
-
-```sh
-npx nx sync
-```
-
-You can enforce that the TypeScript project references are always in the correct state when running in CI by adding a step to your CI job configuration that runs the following command:
-
-```sh
-npx nx sync:check
-```
-
-[Learn more about nx sync](https://nx.dev/reference/nx-commands#sync)
-
-## Nx Cloud
-
-Nx Cloud ensures a [fast and scalable CI](https://nx.dev/nx-cloud?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) pipeline. It includes features such as:
-
-- [Remote caching](https://nx.dev/docs/features/ci-features/remote-cache?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Task distribution across multiple machines](https://nx.dev/docs/features/ci-features/distribute-task-execution?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Automated e2e test splitting](https://nx.dev/docs/features/ci-features/split-e2e-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Task flakiness detection and rerunning](https://nx.dev/docs/features/ci-features/flaky-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-### Set up CI (non-Github Actions CI)
-
-**Note:** This is only required if your CI provider is not GitHub Actions.
-
-Use the following command to configure a CI workflow for your workspace:
-
-```sh
-npx nx g ci-workflow
-```
-
-[Learn more about Nx on CI](https://nx.dev/docs/features/ci-features?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-## Install Nx Console
-
-Nx Console is an editor extension that enriches your developer experience. It lets you run tasks, generate code, and improves code autocompletion in your IDE. It is available for VSCode and IntelliJ.
-
-[Install Nx Console &raquo;](https://nx.dev/docs/getting-started/editor-setup?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-## 🔗 Learn More
-
-- [Nx Documentation](https://nx.dev/docs)
-- [Crafting Your Workspace Tutorial](https://nx.dev/docs/getting-started/tutorials/crafting-your-workspace)
-- [Module Boundaries](https://nx.dev/docs/features/enforce-module-boundaries)
-- [Releasing Packages](https://nx.dev/docs/features/manage-releases)
-- [Nx Plugins](https://nx.dev/docs/concepts/nx-plugins)
-- [Nx Cloud](https://nx.dev/nx-cloud)
-
-## 💬 Community
-
-Join the Nx community:
-
-- [Discord](https://go.nx.dev/community)
-- [X (Twitter)](https://twitter.com/nxdevtools)
-- [LinkedIn](https://www.linkedin.com/company/nrwl)
-- [YouTube](https://www.youtube.com/@nxdevtools)
-- [Blog](https://nx.dev/blog)
+These temp-file batches classify as nothing, which matches. Stated as a
+hypothesis — traced by diffing tarballs, not by profiling.
